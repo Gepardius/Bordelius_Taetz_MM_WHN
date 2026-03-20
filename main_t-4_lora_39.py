@@ -146,7 +146,7 @@ class TemporalPerceiverResampler(nn.Module):
 
         self.layers = nn.ModuleList([
             nn.ModuleDict({
-                # --- CHANGE 4: Self-attention on latents (standard Perceiver pattern) ---
+                # Self-attention on latents (standard Perceiver pattern) ---
                 # Latents communicate with each other BEFORE reading from visual tokens.
                 # This lets the 256 latents coordinate their queries, preventing them from
                 # all attending to the same visual regions.
@@ -181,7 +181,7 @@ class TemporalPerceiverResampler(nn.Module):
         """
         B = step_embeds_list[0].shape[0]
         
-        # --- NEW: Add temporal embeddings BEFORE concatenation ---
+        # --- Add temporal embeddings BEFORE concatenation ---
         processed_steps = []
         for t_idx, step_embeds in enumerate(step_embeds_list):
             # Add the corresponding time embedding to every token in this step
@@ -202,7 +202,6 @@ class TemporalPerceiverResampler(nn.Module):
             )
             latents = layer["norm0"](latents + self_attn_out)
 
-            # Cross-attention with pre-norm via norm1 (was defined but never used before)
             # Pre-norm stabilises training: latents are normalised before attending to
             # the long visual sequence, preventing scale drift across depth=2 layers.
             cross_in = layer["norm1"](latents)
@@ -215,7 +214,8 @@ class TemporalPerceiverResampler(nn.Module):
             latents = latents + layer["ff"](latents)
 
         return self.norm(latents)
-    
+
+# Not used, replaced by TemporalPerceiverSampler
 class PerceiverResampler(nn.Module):
     def __init__(
         self,
@@ -520,9 +520,6 @@ def run_inference(hist_sig, hist_ego, prompt_text, top_k=3):
             no_repeat_ngram_size=3,    # Prevents "and take and take" loops
         )
 
-        # DEBUG PRINTS
-        # print(f"Full output shape: {output_ids.shape}")
-
         generated_texts = []
         for i in range(top_k):
             new_tokens = output_ids[i]
@@ -599,7 +596,6 @@ def get_unpooled_egovlp(motion_model, ego_input):
     handle.remove()
     
     return unpooled_features[0] # Returns [B, 785, 768]
-
 
 def extract_and_save_features(dataloader, output_dir, vision_model, motion_model, device="cuda"):
     os.makedirs(output_dir, exist_ok=True)
@@ -1041,7 +1037,7 @@ if __name__ == '__main__':
             for batch in pbar:
                 if batch is None: continue
 
-                print(f"train_dataset.dataset.dropout_prob {train_dataset.dataset.dropout_prob}")
+                # print(f"train_dataset.dataset.dropout_prob {train_dataset.dataset.dropout_prob}")
 
                 # -------- Bridge Training (4-Step Temporal Window) --------
                 optimizer.zero_grad()
@@ -1071,9 +1067,9 @@ if __name__ == '__main__':
                 # print(f"before compression all_visual_steps_4step {combined_tensor.shape}")
 
                 visual_embeds_4step = temporal_resampler(all_visual_steps)
-                print(f"after compression visual_embeds_4step {visual_embeds_4step.shape}")
+                # print(f"after compression visual_embeds_4step {visual_embeds_4step.shape}")
 
-                print(batch["prompt_text"][0])
+                # print(batch["prompt_text"][0])
 
                 # ... (standard tokenization for prompt/target remains the same) ...
                 prompt_ids = tokenizer(batch["prompt_text"][0], return_tensors="pt").input_ids.to("cuda")
@@ -1120,10 +1116,10 @@ if __name__ == '__main__':
             
             # Calculate average loss for this epoch
             avg_epoch_loss = epoch_loss_sum / max(num_batches, 1)
-            print(f"\nEpoch {epoch_full+1} Average Loss: {avg_epoch_loss:.4f}")
+            # print(f"\nEpoch {epoch_full+1} Average Loss: {avg_epoch_loss:.4f}")
 
             # ONLY SAVE IF THE LOSS IMPROVED
-            print(f"Loss decreased from {best_loss:.4f} to {avg_epoch_loss:.4f}. Saving checkpoint...")
+            # print(f"Loss decreased from {best_loss:.4f} to {avg_epoch_loss:.4f}. Saving checkpoint...")
             best_loss = avg_epoch_loss # Update best loss
 
             checkpoint_name = f"checkpoints/bridge_motion_{USE_MOTION}_{str(train_split)}_{current_file}_{epoch_full}.pt"
