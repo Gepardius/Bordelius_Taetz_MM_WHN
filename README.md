@@ -14,3 +14,17 @@ MultiModel "What happens next" framework
 | **TemporalPerceiverResampler** | Custom Perceiver IO (depth=2, heads=8) | 4 steps x 737 tokens = 2948 tokens | 256 x 3584-D | No (lr 1e-4) | Self-attn + cross-attn latents. `time_embed` stamps each step. |
 | **Qwen 2.5 7B-Instruct** | `AutoModelForCausalLM` (4-bit NF4) | 256 visual + text tokens | Predicted action tokens | Yes (base) | Loaded float16 compute dtype. `use_cache=False` during training. |
 | **LoRA adapters** | r=16, alpha=32, dropout=0.05 | Applied to all 7 attn+FFN layers | ~0.5% trainable params | No (lr 2e-5) | Teaches Qwen to interpret visual tokens without overwriting language knowledge. |
+
+
+
+Motion = True:
+Trainable Parameters in Bridge: 32,603,648
+Trainable Parameters in Resampler: 412,116,992
+Trainable Parameters in LLM (LoRA): 40,370,176
+TOTAL Trainable Parameters: 485,090,816
+
+Motion = False:
+Trainable Parameters in Bridge: 16,988,160
+Trainable Parameters in Resampler: 412,116,992
+Trainable Parameters in LLM (LoRA): 40,370,176
+TOTAL Trainable Parameters: 469,475,328
