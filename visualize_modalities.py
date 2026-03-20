@@ -57,18 +57,14 @@ def _bridge_forward_with_hooks(bridge, sig_t, ego_t, use_motion):
         vis_tokens   : [1, 729, D]  — spatial SigLIP tokens in LLM space
         mot_tokens   : [1, 8,  D]  — motion EgoVLP tokens in LLM space (or None)
         fused_tokens : [1, 737, D] — concatenated output (or [1,729,D])
-
-    Uses float32 for the projection MLPs to prevent the bfloat16 rank-1 collapse
-    that caused PCA PC2=0.0% — same fix as in MultimodalBridge.forward().
-    The module weights are temporarily cast to float32 for computation only;
-    the result is cast back to the original input dtype before returning.
     """
+    # float32 projection to prevent rank-1 collapse (matches lora_39 bridge forward)
     orig_dtype = sig_t.dtype
     vis_tokens = bridge.siglip_proj.float()(sig_t.float()).to(orig_dtype)  # [1, 729, D]
 
     if use_motion and ego_t is not None and bridge.use_motion:
-        ego_sliced = ego_t[:, :8, :]                                              # [1, 8, 768]
-        mot_tokens = bridge.egovlp_proj.float()(ego_sliced.float()).to(orig_dtype)# [1, 8, D]
+        ego_sliced = ego_t[:, :8, :]                                               # [1, 8, 768]
+        mot_tokens = bridge.egovlp_proj.float()(ego_sliced.float()).to(orig_dtype) # [1, 8, D]
         mot_tokens = mot_tokens + bridge.motion_type_embed
         fused = torch.cat([vis_tokens, mot_tokens], dim=1)
         return vis_tokens, mot_tokens, fused
@@ -271,9 +267,19 @@ def fig2_temporal_attention_heatmap(batch, bridge, temporal_resampler, llm,
 def fig3_modality_ablation_bar(batch, bridge, temporal_resampler, llm,
                                tokenizer, use_motion, save_path):
     """
-    Shows: the log-probability of the ground-truth target token sequence under
-    three conditions: (1) all modalities, (2) vision zeroed, (3) motion zeroed.
-    The drop in confidence quantifies each modality's contribution.
+    Shows: log-probability of the ground-truth target under 5 conditions:
+      1. Full model
+      2. Vision tokens zeroed  (SigLIP bridge OUTPUT set to zero)
+      3. Motion tokens zeroed  (EgoVLP bridge OUTPUT set to zero)
+      4. All visual tokens zeroed (both SigLIP + EgoVLP outputs zeroed)
+      5. Text history masked
+
+    IMPORTANT — why we zero the bridge OUTPUT, not the input features:
+    Zeroing the INPUT (sig=zeros) still produces non-zero output because the
+    Linear layers have bias terms. The result is a constant non-zero vector
+    that is indistinguishable from the real output as far as the LLM is
+    concerned. Zeroing the OUTPUT directly is the only reliable way to remove
+    a modality's contribution.
     """
     bridge.eval(); temporal_resampler.eval()
 
@@ -285,17 +291,41 @@ def fig3_modality_ablation_bar(batch, bridge, temporal_resampler, llm,
     prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids.to("cuda")
     target_ids = tokenizer(target_text, return_tensors="pt").input_ids.to("cuda")
 
-    def compute_logprob(sig_override=None, ego_override=None):
+    def compute_logprob(zero_vis=False, zero_mot=False, masked_prompt_ids=None):
+        """
+        zero_vis : zero the 729 SigLIP output tokens from the bridge
+        zero_mot : zero the 8 EgoVLP output tokens from the bridge
+        masked_prompt_ids : alternative prompt token ids (for text ablation)
+        """
         with torch.no_grad():
             all_steps = []
             for t in range(4):
-                sig_t = hist_sig[:, t] if sig_override is None else sig_override
-                ego_t = (hist_ego[:, t] if hist_ego is not None else None) \
-                        if ego_override is None else ego_override
-                _, _, fused = _bridge_forward_with_hooks(bridge, sig_t, ego_t, use_motion)
+                sig_t = hist_sig[:, t]
+                ego_t = hist_ego[:, t] if hist_ego is not None else None
+
+                # Get the separate modality outputs from the bridge
+                vis_tokens, mot_tokens, _ = _bridge_forward_with_hooks(
+                    bridge, sig_t, ego_t, use_motion
+                )
+
+                # Zero the OUTPUT tokens directly — this properly removes
+                # the modality's contribution regardless of bias terms
+                if zero_vis:
+                    vis_tokens = torch.zeros_like(vis_tokens)
+                if zero_mot and mot_tokens is not None:
+                    mot_tokens = torch.zeros_like(mot_tokens)
+
+                # Re-concatenate after optional zeroing
+                if mot_tokens is not None:
+                    fused = torch.cat([vis_tokens, mot_tokens], dim=1)
+                else:
+                    fused = vis_tokens
+
                 all_steps.append(fused)
+
             vis_emb = temporal_resampler(all_steps)
-            p_emb = llm.base_model.model.model.embed_tokens(prompt_ids)
+            use_prompt_ids = masked_prompt_ids if masked_prompt_ids is not None else prompt_ids
+            p_emb = llm.base_model.model.model.embed_tokens(use_prompt_ids)
             t_emb = llm.base_model.model.model.embed_tokens(target_ids)
             full = torch.cat([vis_emb, p_emb, t_emb], dim=1)
             ignore = vis_emb.shape[1] + p_emb.shape[1]
@@ -304,52 +334,44 @@ def fig3_modality_ablation_bar(batch, bridge, temporal_resampler, llm,
             out = llm(inputs_embeds=full, labels=labels)
             return -out.loss.item()   # higher = more confident
 
-    # Full model
+    # 1. Full model
     lp_full = compute_logprob()
 
-    # Zero SigLIP: replace spatial tokens with zeros
-    zero_sig = torch.zeros_like(hist_sig[:, 0])
-    lp_no_vision = compute_logprob(sig_override=zero_sig)
+    # 2. Vision zeroed — zero the 729 SigLIP output tokens
+    lp_no_vision = compute_logprob(zero_vis=True)
 
-    # Zero EgoVLP: replace motion input with zeros
+    # 3. Motion zeroed — zero only the 8 EgoVLP output tokens
     if use_motion and hist_ego is not None:
-        zero_ego = torch.zeros_like(hist_ego[:, 0])
-        lp_no_motion = compute_logprob(ego_override=zero_ego)
+        lp_no_motion = compute_logprob(zero_mot=True)
     else:
-        lp_no_motion = lp_full   # motion not active
+        lp_no_motion = lp_full
 
-    # Zero text history: rebuild prompt with masked history
+    # 4. All visual zeroed — zero both SigLIP and EgoVLP outputs
+    lp_no_visual = compute_logprob(zero_vis=True, zero_mot=True)
+
+    # 5. Text history masked
     masked_prompt = prompt_text.replace(
         "Previous actions:", "Previous actions: None available."
     ).split("t-4:")[0] + f"Predict the next action.:<|im_end|>\n<|im_start|>assistant\n"
     masked_ids = tokenizer(masked_prompt, return_tensors="pt").input_ids.to("cuda")
-    with torch.no_grad():
-        all_steps = []
-        for t in range(4):
-            sig_t = hist_sig[:, t]
-            ego_t = hist_ego[:, t] if hist_ego is not None else None
-            _, _, fused = _bridge_forward_with_hooks(bridge, sig_t, ego_t, use_motion)
-            all_steps.append(fused)
-        vis_emb = temporal_resampler(all_steps)
-        p_emb = llm.base_model.model.model.embed_tokens(masked_ids)
-        t_emb = llm.base_model.model.model.embed_tokens(target_ids)
-        full = torch.cat([vis_emb, p_emb, t_emb], dim=1)
-        ignore = vis_emb.shape[1] + p_emb.shape[1]
-        labels = torch.full((1, full.shape[1]), -100, dtype=torch.long, device="cuda")
-        labels[0, ignore:] = target_ids[0]
-        lp_no_text = -llm(inputs_embeds=full, labels=labels).loss.item()
+    lp_no_text = compute_logprob(masked_prompt_ids=masked_ids)
 
-    conditions = ["Full model", "Vision zeroed\n(SigLIP=0)", "Motion zeroed\n(EgoVLP=0)", "Text history\nmasked"]
-    logprobs   = [lp_full, lp_no_vision, lp_no_motion, lp_no_text]
-    drops      = [lp_full - lp for lp in logprobs]
-    colors = ["#5BAD72", "#4C8EDA", "#E07B54", "#9B59B6"]
+    conditions = [
+        "Full model",
+        "Vision zeroed\n(SigLIP out=0)",
+        "Motion zeroed\n(EgoVLP out=0)",
+        "All visual\nzeroed",
+        "Text history\nmasked",
+    ]
+    logprobs = [lp_full, lp_no_vision, lp_no_motion, lp_no_visual, lp_no_text]
+    drops    = [lp_full - lp for lp in logprobs]
+    colors   = ["#5BAD72", "#4C8EDA", "#E07B54", "#2E86AB", "#9B59B6"]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
     fig.suptitle(
-        f"Fig 3 — Modality ablation (confidence on target)\nTarget: '{target_text}'",
+        f"Fig 3 — Modality ablation (bridge output zeroed)\nTarget: '{target_text}'",
         fontsize=9, ha="left", x=0.02
     )
-    # Absolute log-probs
     axes[0].bar(conditions, logprobs, color=colors, alpha=0.85)
     axes[0].axhline(lp_full, color="black", linestyle="--", linewidth=0.8, label="Full model")
     axes[0].set_ylabel("Log-probability (higher = more confident)")
@@ -358,17 +380,17 @@ def fig3_modality_ablation_bar(batch, bridge, temporal_resampler, llm,
     for i, v in enumerate(logprobs):
         axes[0].text(i, v + 0.01, f"{v:.2f}", ha="center", fontsize=8)
 
-    # Drop from full model
     axes[1].bar(conditions, drops, color=colors, alpha=0.85)
     axes[1].set_ylabel("Confidence drop (full − ablated)")
-    axes[1].set_title("Importance = drop when modality is removed")
+    axes[1].set_title("Importance = drop when modality output is removed")
     for i, v in enumerate(drops):
-        axes[1].text(i, v + 0.005, f"{v:.3f}", ha="center", fontsize=8)
+        axes[1].text(i, max(v, 0) + 0.005, f"{v:.3f}", ha="center", fontsize=8)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close()
     print(f"  Saved → {save_path}")
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
